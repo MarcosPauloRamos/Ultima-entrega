@@ -520,15 +520,7 @@ class CentralMensagens(
         self.log(
             f"LCD <- {code}"
         )
-        if code == 4 and self.connected:
 
-            self.send_byte(
-                254
-            )
-
-            self.log(
-                "TX -> ENTER automatico"
-            )
         #
         # CONFIRMACAO DE EXCLUSAO
         # LCD 21 = Arquivo deletado
