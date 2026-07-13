@@ -31,7 +31,8 @@ module UART_Manager
     input UART_RX,
     output UART_TX,
 
-    output wire [15:0] data_receive
+    output wire [15:0] data_receive,
+    output reg uart_confirm
 );
 
     wire rx_data;
@@ -110,17 +111,32 @@ module UART_Manager
     /*
     Recepcao Python -> FPGA
     */
+    reg [15:0] confirm_counter = 16'd0;
+    
     always @(posedge clk_auto)
     begin
         if (!rdempty)
         begin
             read <= 1'b1;
+    
             UART_reg <= {8'b0, uart_data_read};
+    
+            confirm_counter <= 16'd1000;
         end
         else
         begin
             read <= 1'b0;
+    
+            if (confirm_counter > 0)
+            begin
+                confirm_counter <= confirm_counter - 1'b1;
+            end
         end
+    end
+    
+    always @(posedge clk_auto)
+    begin
+        uart_confirm <= (confirm_counter > 0);
     end
 
     /*
