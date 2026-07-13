@@ -1,0 +1,1259 @@
+// Mensagens exibidas pela interface do sistema:
+//
+// 0 = Bem-vindo ao sistema BM32OS
+// 1 = Operações: 1-processos, 2-arquivos
+// 2 = Quantos arquivos devem ser executados?
+// 3 = Este arquivo não existe!
+// 4 = Executando processos...
+// 5 = Todos os processos terminaram a execução
+// 6 = Escolha a operação de arquivo
+// 7 = 1 - criar, 2 - renomear, 3 - excluir
+// 8 = Não foi possível realizar a operação, o HD está cheio!
+// 9 = Digite a quantidade de instruções do arquivo
+// 10 = Primeiros 16 bits da instrução
+// 11 = Últimos 16 bits da instrução
+// 12 = Digite um ID para o novo arquivo
+// 13 = O novo ID não pode ser igual a um ID existente!
+// 14 = Arquivo criado com sucesso
+// 15 = Escolha um arquivo para ser renomeado
+// 16 = Escolha um arquivo existente!
+// 17 = Escolha o novo ID do arquivo
+// 18 = O ID escolhido deve ser único!
+// 19 = Arquivo renomeado com sucesso
+// 20 = Escolha um arquivo para ser excluído
+// 21 = Arquivo excluído com sucesso
+// 29 = Digite os IDs dos arquivos
+// 30 = O processo necessita de uma entrada
+// 31 = O processo necessita realizar uma saída
+// 32 = Um processo terminou sua execução
+// 33 = Um processo necessita receber dados pela UART
+// 34 = Um processo necessita enviar dados pela UART
+
+
+/**** Valores relacionados ao sistema operacional ****/
+
+// Quantidade máxima de processos suportada pelo sistema.
+//
+// Esse valor é configurado durante a inicialização do sistema
+// e também é utilizado como limite para percorrer os vetores.
+int MAX_PROC_NUM;
+
+
+// Quantidade máxima de arquivos suportada pelo sistema.
+//
+// Define o tamanho útil das estruturas responsáveis pelo
+// armazenamento das informações dos arquivos.
+int MAX_FILE_NUM;
+
+
+// Quantidade atual de arquivos armazenados no HD.
+//
+// Esse valor é alterado sempre que um arquivo é criado
+// ou removido do sistema.
+int FILE_AMOUNT;
+
+
+// Armazena o código da interrupção solicitada pelo processo.
+//
+// O código é obtido de um registrador especial do processador
+// quando o controle retorna do processo para o sistema operacional.
+int INTERRUPTION;
+
+
+// Tamanho da região do HD reservada para cada arquivo.
+//
+// Essa região determina quantas posições cada arquivo pode
+// ocupar dentro do dispositivo de armazenamento.
+int HD_REGION;
+
+
+// Tamanho da região da memória reservada para cada processo.
+//
+// Cada processo possui uma área própria para armazenar o
+// contexto de seus registradores durante uma troca de contexto.
+int MEM_REGION;
+
+
+// Variável utilizada para interromper temporariamente a interface.
+//
+// A leitura de entrada impede que determinadas mensagens sejam
+// substituídas imediatamente, aguardando uma confirmação externa.
+int STOP_BASH;
+
+
+/**** Estruturas de dados dos arquivos ****/
+
+// Armazena os IDs dos arquivos existentes.
+//
+// Cada posição do vetor representa um arquivo do sistema.
+// O valor 99 é utilizado posteriormente para indicar uma
+// posição livre na tabela de arquivos.
+int file_IDS[15];
+
+
+// Armazena a posição inicial de cada arquivo no HD.
+//
+// O índice utilizado neste vetor é o mesmo índice utilizado
+// nos vetores file_IDS e file_end.
+int file_begin[15];
+
+
+// Armazena a posição final de cada arquivo no HD.
+//
+// Com file_begin e file_end, o sistema consegue determinar
+// a região do HD ocupada pelas instruções de cada arquivo.
+int file_end[15];
+
+
+/**** Estruturas de dados dos processos ****/
+
+// Armazena o estado de execução de cada processo.
+//
+// 0 = processo pronto para ser executado.
+// 1 = processo que já terminou sua execução.
+int proc_state[15];
+
+
+// Fila de processos utilizada pelo escalonador Round Robin.
+//
+// O vetor armazena os IDs dos arquivos escolhidos para execução,
+// determinando a ordem em que os processos receberão o processador.
+int proc_queue[15];
+
+
+// Armazena o Program Counter de cada processo.
+//
+// Durante uma troca de contexto, o endereço da próxima instrução
+// de cada processo é salvo neste vetor. Dessa forma, quando o
+// processo voltar a executar, ele continuará do ponto em que parou.
+int proc_PCS[15];
+
+
+/**** Funções relacionadas aos processos ****/
+
+
+// Reinicia o Program Counter de todos os processos.
+//
+// Essa função é chamada depois que um conjunto de processos
+// termina sua execução. Assim, os processos poderão começar
+// novamente a partir da primeira instrução em uma futura execução.
+void reset_program_counters( void ) {
+	int idx;
+
+	// A posição zero não é utilizada para armazenar processos.
+	// Por isso, a busca começa na posição 1.
+	idx = 1;
+
+	// Percorre todas as posições destinadas aos processos.
+	while( idx < MAX_PROC_NUM ) {
+
+		// Define o Program Counter do processo como zero,
+		// fazendo com que uma nova execução comece do início.
+		proc_PCS[ idx ] = 0;
+
+		idx = idx + 1;
+	}
+
+	return;
+}
+
+
+// Limpa a fila de processos para futuras execuções.
+//
+// Depois que o escalonamento termina, todos os valores da fila
+// são definidos como zero para que novos processos possam ser
+// selecionados sem manter dados da execução anterior.
+void reset_process_queue( void ) {
+	int idx;
+
+	idx = 0;
+
+	// Percorre todas as posições da fila.
+	while( idx < MAX_PROC_NUM ) {
+
+		// Remove o ID anteriormente armazenado na posição.
+		proc_queue[ idx ] = 0;
+
+		idx = idx + 1;
+	}
+
+	return;
+}
+
+
+// Verifica se um determinado ID de arquivo existe.
+//
+// Retorna 1 caso o ID seja encontrado na tabela de arquivos.
+// Retorna 0 caso o ID não esteja cadastrado.
+int check_ID( int ID ) {
+	int idx;
+	int ret_value;
+
+	// A posição zero da tabela não é utilizada.
+	idx = 1;
+
+	// Inicialmente, considera-se que o ID não foi encontrado.
+	ret_value = 0;
+
+	// Percorre a tabela procurando pelo ID recebido.
+	while( idx < MAX_PROC_NUM ) {
+
+		if( file_IDS[ idx ] == ID ) {
+
+			// O ID foi encontrado.
+			ret_value = 1;
+
+			// Força o encerramento do laço, pois não é
+			// necessário continuar procurando.
+			idx = MAX_PROC_NUM;
+		}
+		else {
+
+			// Avança para a próxima posição da tabela.
+			idx = idx + 1;
+		}
+	}
+
+	return ret_value;
+}
+
+
+// Obtém o índice correspondente ao ID de um processo.
+//
+// Os processos são identificados pelo mesmo ID dos arquivos
+// executáveis armazenados no sistema. Essa função procura o ID
+// na tabela de arquivos e retorna a posição em que ele está salvo.
+int get_proc_idx( int proc_ID ) {
+	int idx;
+	int proc_idx;
+
+	// A posição zero não é utilizada.
+	idx = 1;
+
+	// Percorre a tabela de arquivos.
+	while( idx < MAX_PROC_NUM ) {
+
+		if( file_IDS[ idx ] == proc_ID ) {
+
+			// Salva o índice correspondente ao processo.
+			proc_idx = idx;
+
+			// Encerra o laço depois de encontrar o processo.
+			idx = MAX_PROC_NUM;
+		}
+		else {
+
+			// Continua procurando nas próximas posições.
+			idx = idx + 1;
+		}
+	}
+
+	return proc_idx;
+}
+
+
+// Carrega o contexto de um processo antes de sua execução.
+//
+// A função realiza duas operações principais:
+//
+// 1. Transfere as instruções do processo do HD para a memória.
+// 2. Recupera os valores dos registradores salvos anteriormente.
+//
+// Dessa forma, o processo pode continuar sua execução exatamente
+// do ponto em que havia sido interrompido.
+void load_proc_context( int proc_idx ) {
+	int transfer_iterations;
+	int transfer_idx;
+
+	// Calcula a quantidade de instruções existentes no arquivo.
+	//
+	// A diferença entre a posição final e a posição inicial
+	// representa a quantidade de posições que precisam ser
+	// transferidas do HD para a memória.
+	transfer_iterations = file_end[ proc_idx ] - file_begin[ proc_idx ];
+
+	// Inicia a transferência pela primeira instrução.
+	transfer_idx = 0;
+
+	// Transfere cada instrução do processo do HD para a memória.
+	while( transfer_idx < transfer_iterations ) {
+
+		// Parâmetros:
+	 // proc_idx     = índice do processo;
+		// transfer_idx = linha do arquivo no HD;
+		// transfer_idx = linha de destino na memória.
+		//
+		// As instruções são carregadas a partir da posição zero
+		// da memória de instruções utilizada pelo processador.
+		move_HD_mem( proc_idx, transfer_idx, transfer_idx );
+
+		transfer_idx = transfer_idx + 1;
+	}
+
+	// Calcula o início da região de memória reservada
+	// para armazenar o contexto deste processo.
+	//
+	// Cada processo possui uma região própria, evitando que os
+	// registradores de um processo sobrescrevam os de outro.
+	transfer_idx = proc_idx * MEM_REGION;
+
+	// Recupera o valor salvo do registrador 1.
+	load_reg_context( 1, transfer_idx, 1 );
+
+	// Recupera o valor salvo do registrador 2.
+	load_reg_context( 2, transfer_idx, 2 );
+
+	// Recupera o valor salvo do registrador 3.
+	load_reg_context( 3, transfer_idx, 3 );
+
+	// Recupera o valor salvo do registrador 4.
+	load_reg_context( 4, transfer_idx, 4 );
+
+	// Recupera o valor salvo do registrador 5.
+	load_reg_context( 5, transfer_idx, 5 );
+
+	// Recupera o valor salvo do registrador 6.
+	load_reg_context( 6, transfer_idx, 6 );
+
+	// Recupera o valor salvo do registrador 7.
+	load_reg_context( 7, transfer_idx, 7 );
+
+	// Recupera o valor salvo do registrador 8.
+	load_reg_context( 8, transfer_idx, 8 );
+
+	// Recupera o valor salvo do registrador 9.
+	load_reg_context( 9, transfer_idx, 9 );
+
+	// Recupera o valor salvo do registrador 10.
+	load_reg_context( 10, transfer_idx, 10 );
+
+	// Recupera o valor salvo do registrador 11.
+	load_reg_context( 11, transfer_idx, 11 );
+
+	// Recupera o valor salvo do registrador 12.
+	load_reg_context( 12, transfer_idx, 12 );
+
+	// Recupera o valor salvo do registrador 13.
+	load_reg_context( 13, transfer_idx, 13 );
+
+	// Recupera o valor salvo do registrador 14.
+	load_reg_context( 14, transfer_idx, 14 );
+
+	// Recupera o valor salvo do registrador 15.
+	load_reg_context( 15, transfer_idx, 15 );
+
+	// Recupera o valor salvo do registrador 16.
+	load_reg_context( 16, transfer_idx, 16 );
+
+	// Recupera o valor salvo do registrador 17.
+	load_reg_context( 17, transfer_idx, 17 );
+
+	// Recupera o valor salvo do registrador 18.
+	load_reg_context( 18, transfer_idx, 18 );
+
+	// Recupera o valor salvo do registrador 19.
+	load_reg_context( 19, transfer_idx, 19 );
+
+	// Recupera o valor salvo do registrador 20.
+	load_reg_context( 20, transfer_idx, 20 );
+
+	// Recupera o valor salvo do registrador 21.
+	load_reg_context( 21, transfer_idx, 21 );
+
+	// Recupera o valor salvo do registrador 22.
+	load_reg_context( 22, transfer_idx, 22 );
+
+	// Recupera o valor salvo do registrador 23.
+	load_reg_context( 23, transfer_idx, 23 );
+
+	// Recupera o valor salvo do registrador 24.
+	load_reg_context( 24, transfer_idx, 24 );
+
+	// Recupera o valor salvo do registrador 25.
+	load_reg_context( 25, transfer_idx, 25 );
+
+	// Recupera o valor salvo do registrador 26.
+	load_reg_context( 26, transfer_idx, 26 );
+
+	// Recupera o valor salvo do registrador 27.
+	//
+	// Neste sistema, esse registrador também é utilizado
+	// para a troca de dados de entrada e saída dos processos.
+	load_reg_context( 27, transfer_idx, 27 );
+
+	// Recupera o valor salvo do registrador 28.
+	//
+	// Esse registrador está relacionado ao código de interrupção
+	// solicitado pelo processo.
+	load_reg_context( 28, transfer_idx, 28 );
+
+	// Recupera o valor salvo do registrador 29.
+	load_reg_context( 29, transfer_idx, 29 );
+
+	// Recupera o valor salvo do registrador 30.
+	load_reg_context( 30, transfer_idx, 30 );
+
+	// Recupera o valor salvo do registrador 31.
+	load_reg_context( 31, transfer_idx, 31 );
+
+	return;
+}
+// Salva o contexto de um processo.
+//
+// Essa função é chamada sempre que ocorre uma troca de contexto.
+// Todos os registradores do processo são armazenados em uma região
+// exclusiva da memória, permitindo que o processo continue sua
+// execução futuramente exatamente do ponto em que foi interrompido.
+void store_proc_context( int proc_idx ) {
+	int transfer_idx;
+
+	// Calcula o início da região de memória reservada para este processo.
+	transfer_idx = proc_idx * MEM_REGION;
+
+	// Salva o conteúdo de todos os registradores.
+	//
+	// Cada chamada copia um registrador do processador para a área
+	// de contexto correspondente ao processo.
+	store_reg_context( 1, transfer_idx, 1 );
+	store_reg_context( 2, transfer_idx, 2 );
+	store_reg_context( 3, transfer_idx, 3 );
+	store_reg_context( 4, transfer_idx, 4 );
+	store_reg_context( 5, transfer_idx, 5 );
+	store_reg_context( 6, transfer_idx, 6 );
+	store_reg_context( 7, transfer_idx, 7 );
+	store_reg_context( 8, transfer_idx, 8 );
+	store_reg_context( 9, transfer_idx, 9 );
+	store_reg_context( 10, transfer_idx, 10 );
+	store_reg_context( 11, transfer_idx, 11 );
+	store_reg_context( 12, transfer_idx, 12 );
+	store_reg_context( 13, transfer_idx, 13 );
+	store_reg_context( 14, transfer_idx, 14 );
+	store_reg_context( 15, transfer_idx, 15 );
+	store_reg_context( 16, transfer_idx, 16 );
+	store_reg_context( 17, transfer_idx, 17 );
+	store_reg_context( 18, transfer_idx, 18 );
+	store_reg_context( 19, transfer_idx, 19 );
+	store_reg_context( 20, transfer_idx, 20 );
+	store_reg_context( 21, transfer_idx, 21 );
+	store_reg_context( 22, transfer_idx, 22 );
+	store_reg_context( 23, transfer_idx, 23 );
+	store_reg_context( 24, transfer_idx, 24 );
+	store_reg_context( 25, transfer_idx, 25 );
+	store_reg_context( 26, transfer_idx, 26 );
+	store_reg_context( 27, transfer_idx, 27 );
+	store_reg_context( 28, transfer_idx, 28 );
+	store_reg_context( 29, transfer_idx, 29 );
+	store_reg_context( 30, transfer_idx, 30 );
+	store_reg_context( 31, transfer_idx, 31 );
+
+	return;
+}
+
+
+// Escalonador Round Robin.
+//
+// Percorre continuamente a fila de processos, concedendo um
+// intervalo de execução para cada processo ativo.
+//
+// Quando ocorre uma interrupção, o controle retorna ao sistema
+// operacional, que realiza a ação necessária e então agenda o
+// próximo processo da fila.
+void round_robin( int proc_amount ) {
+	int proc_ID;
+	int finished_procs;
+	int queue_idx;
+	int proc_idx;
+	int io_var;
+	int proc_pc;
+
+	// Nenhum processo terminou inicialmente.
+	finished_procs = 0;
+
+	// A execução começa pelo primeiro processo da fila.
+	queue_idx = 0;
+
+	// Todos os processos iniciam no endereço zero.
+	proc_pc = 0;
+
+	// Informa ao usuário que os processos começaram.
+	write_lcd( 4 );
+
+	// Aguarda confirmação antes de iniciar.
+	STOP_BASH = input( );
+
+	// Continua executando enquanto ainda existir processo ativo.
+	while( finished_procs < proc_amount ) {
+
+		// Obtém o ID do próximo processo da fila.
+		proc_ID = proc_queue[ queue_idx ];
+
+		// Localiza esse processo na tabela.
+		proc_idx = get_proc_idx( proc_ID );
+
+		// Executa apenas processos que ainda não finalizaram.
+		if( proc_state[ proc_idx ] == 0 ) {
+
+			// Recupera o Program Counter salvo anteriormente.
+			proc_pc = proc_PCS[ proc_idx ];
+
+			// Configura o PC do processador.
+			set_proc_pc( proc_pc );
+
+			// Carrega memória e registradores do processo.
+			load_proc_context( proc_idx );
+
+			// Entrega o controle ao processo.
+			swap_process( proc_idx );
+
+			// Quando ocorre uma interrupção, o sistema operacional
+			// volta automaticamente a assumir o controle.
+			recover_OS( );
+
+			// Lê o código da interrupção gerado pelo processo.
+			INTERRUPTION = get_interruption( );
+
+			// Salva o novo Program Counter do processo.
+			proc_PCS[ proc_idx ] = get_proc_pc( );
+
+			/**************************************************
+			 * Interrupção de Entrada
+			 **************************************************/
+			if( INTERRUPTION == 2 ) {
+
+				// Solicita um dado ao usuário.
+				write_lcd( 30 );
+
+				io_var = input( );
+
+				output( io_var );
+
+				// Copia o dado para o registrador 27 do processo.
+				move_reg_OS_proc( io_var, 27 );
+			}
+
+			/**************************************************
+			 * Interrupção de Saída
+			 **************************************************/
+			if( INTERRUPTION == 3 ) {
+
+				write_lcd( 31 );
+
+				// Copia o valor produzido pelo processo para o SO.
+				move_reg_proc_OS( 27, io_var );
+
+				output( io_var );
+			}
+
+			/**************************************************
+			 * Processo finalizado
+			 **************************************************/
+			if( INTERRUPTION == 4 ) {
+
+				write_lcd( 32 );
+
+				output( proc_idx );
+
+				// Marca o processo como encerrado.
+				proc_state[ proc_idx ] = 1;
+
+				// Atualiza a quantidade de processos concluídos.
+				finished_procs = finished_procs + 1;
+			}
+
+			/**************************************************
+			 * Recepção pela UART
+			 **************************************************/
+			if( INTERRUPTION == 5 ) {
+
+				write_lcd( 33 );
+
+				// Recebe um dado da UART.
+				io_var = UART_input( );
+
+				output( io_var );
+
+				// Disponibiliza o dado ao processo.
+				move_reg_OS_proc( io_var, 27 );
+			}
+
+			/**************************************************
+			 * Transmissão pela UART
+			 **************************************************/
+			if( INTERRUPTION == 6 ) {
+
+				write_lcd( 34 );
+
+				// Obtém o dado produzido pelo processo.
+				move_reg_proc_OS( 27, io_var );
+
+				// Envia o dado pela UART.
+				UART_output( io_var );
+			}
+
+			// Salva novamente todo o contexto do processo,
+			// permitindo que ele continue depois.
+			store_proc_context( proc_idx );
+		}
+
+		// Avança para o próximo processo da fila.
+		//
+		// Quando chega ao final, retorna ao início,
+		// caracterizando o comportamento circular do
+		// algoritmo Round Robin.
+		if( queue_idx < proc_amount - 1 ) {
+			queue_idx = queue_idx + 1;
+		}
+		else {
+			queue_idx = 0;
+		}
+	}
+
+	// Todos os processos terminaram.
+	write_lcd( 5 );
+
+	STOP_BASH = input( );
+
+	return;
+}
+
+
+// Configura uma nova execução de processos.
+//
+// Essa função solicita ao usuário quais arquivos deverão ser
+// executados e monta a fila utilizada pelo escalonador.
+void process_operation( void ) {
+	int proc_amount;
+	int queue_idx;
+	int proc_ID;
+
+	// Pergunta quantos processos serão executados.
+	write_lcd( 2 );
+
+	proc_amount = input( );
+
+	output( proc_amount );
+
+	queue_idx = 0;
+
+	// Solicita os IDs dos arquivos.
+	write_lcd( 29 );
+
+	while( queue_idx < proc_amount ) {
+
+		proc_ID = input( );
+
+		// Continua solicitando enquanto o ID não existir.
+		while( check_ID( proc_ID ) != 1 ) {
+
+			write_lcd( 3 );
+
+			proc_ID = input( );
+		}
+
+		output( proc_ID );
+
+		// Insere o processo na fila de execução.
+		proc_queue[ queue_idx ] = proc_ID;
+
+		// Marca o processo como apto para execução.
+		proc_state[ queue_idx ] = 0;
+
+		queue_idx = queue_idx + 1;
+	}
+
+	// Inicia o escalonamento.
+	round_robin( proc_amount );
+
+	// Limpa as estruturas para uma próxima execução.
+	reset_process_queue( );
+	reset_program_counters( );
+
+	return;
+}
+
+
+/*****************************************************
+ * Funções relacionadas aos arquivos
+ ****************************************************/
+
+
+// Retorna a próxima posição livre da tabela de arquivos.
+//
+// O valor 99 representa uma posição disponível.
+int get_free_file_position( void ) {
+	int idx;
+	int ret_idx;
+
+	idx = 1;
+
+	ret_idx = 0;
+
+	while( idx < MAX_FILE_NUM ) {
+
+		if( file_IDS[ idx ] == 99 ) {
+
+			ret_idx = idx;
+
+			idx = MAX_FILE_NUM;
+		}
+		else {
+
+			idx = idx + 1;
+		}
+	}
+
+	return ret_idx;
+}
+// Cria um novo arquivo no HD.
+//
+// A função recebe o índice livre da tabela de arquivos.
+// Depois, solicita ao usuário:
+//
+// 1. A quantidade de instruções do arquivo;
+// 2. Os primeiros 16 bits de cada instrução;
+// 3. Os últimos 16 bits de cada instrução;
+// 4. Um ID único para identificar o arquivo.
+void create_file( int file_idx ) {
+	int file_ID;
+	int file_instructions;
+	int idx;
+	int first_bits;
+	int last_bits;
+	int instruction;
+
+	// Solicita a quantidade de instruções que o novo arquivo terá.
+	write_lcd( 9 );
+
+	file_instructions = input( );
+
+	// Exibe o valor recebido para confirmação.
+	output( file_instructions );
+
+	// Inicia o índice da primeira instrução.
+	idx = 0;
+
+	// Recebe e armazena todas as instruções do arquivo.
+	while( idx < file_instructions ) {
+
+		// Solicita os primeiros 16 bits da instrução.
+		write_lcd( 10 );
+
+		first_bits = input( );
+
+		// Solicita os últimos 16 bits da instrução.
+		write_lcd( 11 );
+
+		last_bits = input( );
+
+		// Junta as duas partes de 16 bits para formar
+		// uma instrução completa de 32 bits.
+		instruction = concatenate( first_bits, last_bits );
+
+		// Armazena a instrução no HD.
+		//
+		// Parâmetros:
+		// file_idx = índice do arquivo;
+		// idx      = posição da instrução dentro do arquivo;
+		// instruction = instrução completa de 32 bits.
+		store_HD( file_idx, idx, instruction );
+
+		// Avança para a próxima instrução.
+		idx = idx + 1;
+	}
+
+	// Depois de armazenar todas as instruções,
+	// solicita um ID para o novo arquivo.
+	write_lcd( 12 );
+
+	file_ID = input( );
+
+	output( file_ID );
+
+	// Verifica se o ID escolhido já pertence a outro arquivo.
+	//
+	// O sistema continua solicitando um novo ID enquanto
+	// o usuário escolher um valor que já está em uso.
+	while( check_ID( file_ID ) == 1 ) {
+
+		write_lcd( 13 );
+
+		file_ID = input( );
+	}
+
+	// Armazena o ID escolhido na tabela de arquivos.
+	file_IDS[ file_idx ] = file_ID;
+
+	// Define a posição inicial do arquivo.
+	//
+	// Como cada arquivo possui uma região própria no HD,
+	// suas instruções começam na posição zero dessa região.
+	file_begin[ file_idx ] = 0;
+
+	// Define a posição final do arquivo com base na
+	// quantidade de instruções armazenadas.
+	file_end[ file_idx ] = file_instructions;
+
+	// Informa que o arquivo foi criado com sucesso.
+	write_lcd( 14 );
+
+	// Aguarda uma confirmação antes de retornar ao menu.
+	STOP_BASH = input( );
+
+	return;
+}
+
+
+// Renomeia um arquivo existente.
+//
+// O usuário informa o ID atual do arquivo e, depois,
+// escolhe um novo ID que ainda não esteja sendo utilizado.
+void rename_file( void ) {
+	int idx;
+	int file_ID;
+	int new_ID;
+
+	// Solicita o ID do arquivo que será renomeado.
+	write_lcd( 15 );
+
+	file_ID = input( );
+
+	output( file_ID );
+
+	// Verifica se o arquivo informado realmente existe.
+	//
+	// Enquanto o ID não for encontrado, o sistema solicita
+	// novamente um arquivo válido.
+	while( check_ID( file_ID ) != 1 ) {
+
+		write_lcd( 16 );
+
+		file_ID = input( );
+	}
+
+	// Solicita o novo ID do arquivo.
+	write_lcd( 17 );
+
+	new_ID = input( );
+
+	output( new_ID );
+
+	// O novo ID precisa ser único.
+	//
+	// Caso o ID já pertença a outro arquivo, o usuário
+	// deverá informar um valor diferente.
+	while( check_ID( new_ID ) == 1 ) {
+
+		write_lcd( 18 );
+
+		new_ID = input( );
+	}
+
+	// A busca começa na posição 1, pois a posição zero
+	// não é utilizada para armazenar arquivos executáveis.
+	idx = 1;
+
+	// Procura o arquivo na tabela de IDs.
+	while( idx < MAX_PROC_NUM ) {
+
+		if( file_IDS[ idx ] == file_ID ) {
+
+			// Substitui o ID antigo pelo novo ID.
+			//
+			// Apenas o nome identificador é alterado.
+			// As instruções armazenadas no HD permanecem iguais.
+			file_IDS[ idx ] = new_ID;
+
+			// Encerra a busca após encontrar o arquivo.
+			idx = MAX_PROC_NUM;
+		}
+		else {
+
+			// Continua procurando nas próximas posições.
+			idx = idx + 1;
+		}
+	}
+
+	// Informa que o arquivo foi renomeado com sucesso.
+	write_lcd( 19 );
+
+	// Aguarda uma confirmação antes de retornar.
+	STOP_BASH = input( );
+
+	return;
+}
+
+
+// Exclui um arquivo do sistema.
+//
+// A exclusão remove as referências do arquivo na tabela.
+// O ID recebe o valor 99, indicando que a posição está livre.
+void delete_file( void ) {
+	int idx;
+	int file_ID;
+
+	// Solicita o ID do arquivo que será excluído.
+	write_lcd( 20 );
+
+	file_ID = input( );
+
+	output( file_ID );
+
+	// Verifica se o arquivo informado existe.
+	//
+	// Enquanto o ID não for encontrado, o sistema
+	// solicita um arquivo válido.
+	while( check_ID( file_ID ) != 1 ) {
+
+		write_lcd( 16 );
+
+		file_ID = input( );
+	}
+
+	// Inicia a busca na primeira posição utilizada.
+	idx = 1;
+
+	// Procura o arquivo na tabela de IDs.
+	while( idx < MAX_PROC_NUM ) {
+
+		if( file_IDS[ idx ] == file_ID ) {
+
+			// Remove as referências do arquivo no sistema.
+			//
+			// O valor 99 indica que essa posição da tabela
+			// está disponível para armazenar um novo arquivo.
+			file_IDS[ idx ] = 99;
+
+			// Reinicia as posições inicial e final do arquivo.
+			//
+			// Nesta implementação, os dados não são apagados
+			// diretamente do HD. As referências são removidas,
+			// permitindo que essa região seja reutilizada.
+			file_begin[ idx ] = 0;
+			file_end[ idx ] = 0;
+
+			// Encerra a busca após encontrar o arquivo.
+			idx = MAX_PROC_NUM;
+		}
+		else {
+
+			// Continua procurando nas próximas posições.
+			idx = idx + 1;
+		}
+	}
+
+	// Informa que o arquivo foi excluído com sucesso.
+	write_lcd( 21 );
+
+	// Aguarda uma confirmação antes de retornar ao menu.
+	STOP_BASH = input( );
+
+	return;
+}
+
+
+// Controla as operações relacionadas aos arquivos.
+//
+// O usuário pode escolher entre:
+//
+// 1 = criar um arquivo;
+// 2 = renomear um arquivo;
+// 3 = excluir um arquivo.
+void file_operation( void ) {
+	int file_idx;
+	int file_ID;
+	int file_position;
+	int file_option;
+
+	// Exibe a mensagem de escolha da operação de arquivo.
+	write_lcd( 6 );
+
+	// Aguarda uma confirmação antes de apresentar as opções.
+	STOP_BASH = input( );
+
+	// Exibe as opções disponíveis.
+	write_lcd( 7 );
+
+	file_option = input( );
+
+	output( file_option );
+
+	/**************************************************
+	 * Opção 1: criar um novo arquivo
+	 **************************************************/
+	if( file_option == 1 ) {
+
+		// Verifica se a quantidade atual de arquivos
+		// atingiu o limite máximo suportado.
+		if( MAX_FILE_NUM == FILE_AMOUNT ) {
+
+			// Informa que não existem posições livres no HD.
+			write_lcd( 8 );
+
+			STOP_BASH = input( );
+		}
+		else {
+
+			// Procura a próxima posição livre
+			// na tabela de arquivos.
+			file_idx = get_free_file_position( );
+
+			// Cria o arquivo na posição encontrada.
+			create_file( file_idx );
+
+			// Atualiza a quantidade total de arquivos.
+			FILE_AMOUNT = FILE_AMOUNT + 1;
+		}
+	}
+
+	/**************************************************
+	 * Opção 2: renomear um arquivo
+	 **************************************************/
+	if( file_option == 2 ) {
+
+		rename_file( );
+	}
+
+	/**************************************************
+	 * Opção 3: excluir um arquivo
+	 **************************************************/
+	if( file_option == 3 ) {
+
+		delete_file( );
+
+		// Atualiza a quantidade total de arquivos.
+		FILE_AMOUNT = FILE_AMOUNT - 1;
+	}
+
+	return;
+}
+/**** Funções principais do sistema ****/
+
+
+// Controla o menu principal do sistema operacional.
+//
+// Essa função funciona como uma interface básica entre o usuário
+// e as operações disponíveis no sistema.
+//
+// As opções são:
+//
+// 1 = operações relacionadas aos processos;
+// 2 = operações relacionadas aos arquivos.
+void bash( void ) {
+	int bash_option;
+
+	// Exibe as opções principais do sistema.
+	write_lcd( 1 );
+
+	// Recebe a opção escolhida pelo usuário.
+	bash_option = input( );
+
+	// Exibe o valor recebido para confirmação.
+	output( bash_option );
+
+	/**************************************************
+	 * Opção 1: operações relacionadas aos processos
+	 **************************************************/
+	if( bash_option == 1 ) {
+
+		// Permite selecionar arquivos executáveis
+		// e iniciar o escalonamento dos processos.
+		process_operation( );
+	}
+
+	/**************************************************
+	 * Opção 2: operações relacionadas aos arquivos
+	 **************************************************/
+	if( bash_option == 2 ) {
+
+		// Permite criar, renomear ou excluir arquivos.
+		file_operation( );
+	}
+
+	return;
+}
+
+
+// Inicializa as estruturas e variáveis do sistema operacional.
+//
+// Essa função configura:
+//
+// 1. A quantidade máxima de processos;
+// 2. A quantidade máxima de arquivos;
+// 3. A quantidade inicial de arquivos;
+// 4. O tamanho das regiões do HD e da memória;
+// 5. Os IDs dos arquivos conhecidos;
+// 6. Os Program Counters dos processos;
+// 7. As posições inicial e final dos programas no HD.
+void init( void ) {
+	int idx;
+
+	/**************************************************
+	 * Configuração das variáveis do sistema
+	 **************************************************/
+
+	// Define a quantidade máxima de processos suportados.
+	MAX_PROC_NUM = 15;
+
+	// Define a quantidade máxima de arquivos suportados.
+	MAX_FILE_NUM = 15;
+
+	// Define a quantidade inicial de arquivos conhecidos.
+	//
+	// O sistema considera inicialmente dez posições ocupadas,
+	// incluindo a posição zero reservada.
+	FILE_AMOUNT = 10;
+
+	// Define o tamanho da região reservada para cada arquivo no HD.
+	HD_REGION = 1024;
+
+	// Define o tamanho da região de memória reservada
+	// para salvar o contexto de cada processo.
+	MEM_REGION = 252;
+
+
+	/**************************************************
+	 * Inicialização da tabela de arquivos
+	 **************************************************/
+
+	// A posição zero é reservada, por isso o índice começa em 1.
+	idx = 1;
+
+	// Percorre todas as posições destinadas aos arquivos.
+	while( idx < MAX_PROC_NUM ) {
+
+		if( idx < 10 ) {
+
+			// Os índices de 1 até 9 correspondem aos
+			// arquivos já conhecidos pelo sistema.
+			//
+			// O ID do arquivo é igual ao próprio índice.
+			file_IDS[ idx ] = idx;
+		}
+		else {
+
+			// Os índices de 10 até 14 começam livres.
+			//
+			// O valor 99 indica que não existe um
+			// arquivo cadastrado nessa posição.
+			file_IDS[ idx ] = 99;
+		}
+
+		// Reinicia o Program Counter de cada processo.
+		//
+		// Dessa forma, todos os processos começam sua
+		// primeira execução a partir da instrução zero.
+		proc_PCS[ idx ] = 0;
+
+		idx = idx + 1;
+	}
+
+
+	/**************************************************
+	 * Configuração das posições dos arquivos no HD
+	 **************************************************/
+
+	// Inicializa a posição zero da tabela.
+	//
+	// Essa posição não representa um programa executável,
+	// mas é configurada para evitar valores indefinidos.
+	file_begin[ 0 ] = 0;
+	file_end[ 0 ] = 0;
+
+
+	// Programa 1: cálculo de potência.
+	//
+	// O arquivo começa na posição zero de sua região no HD
+	// e possui instruções até a posição 51.
+	file_begin[ 1 ] = 0;
+	file_end[ 1 ] = 51;
+
+
+	// Programa 2: cálculo da sequência de Fibonacci.
+	//
+	// O arquivo possui instruções até a posição 68.
+	file_begin[ 2 ] = 0;
+	file_end[ 2 ] = 68;
+
+
+	// Programa 3: busca do maior valor.
+	//
+	// O arquivo possui instruções até a posição 75.
+	file_begin[ 3 ] = 0;
+	file_end[ 3 ] = 75;
+
+
+	// Programa 4: busca do menor valor.
+	//
+	// O arquivo possui instruções até a posição 76.
+	file_begin[ 4 ] = 0;
+	file_end[ 4 ] = 76;
+
+
+	// Programa 5: algoritmo Selection Sort.
+	//
+	// O arquivo possui instruções até a posição 154.
+	file_begin[ 5 ] = 0;
+	file_end[ 5 ] = 154;
+
+
+	// Programa 6: cálculo da média de um vetor.
+	//
+	// O arquivo possui instruções até a posição 72.
+	file_begin[ 6 ] = 0;
+	file_end[ 6 ] = 72;
+
+
+	// Programa 7: posição reservada.
+	//
+	// Como ainda não existem instruções cadastradas,
+	// as posições inicial e final permanecem em zero.
+	file_begin[ 7 ] = 0;
+	file_end[ 7 ] = 0;
+
+
+	// Programa 8: posição reservada.
+	file_begin[ 8 ] = 0;
+	file_end[ 8 ] = 0;
+
+
+	// Programa 9: posição reservada.
+	file_begin[ 9 ] = 0;
+	file_end[ 9 ] = 0;
+
+	return;
+}
+
+
+// Função principal do sistema operacional.
+//
+// Essa é a primeira função executada. Ela inicializa o sistema,
+// exibe a mensagem de boas-vindas e mantém o menu principal
+// funcionando continuamente.
+void main( void ) {
+
+	// Inicializa todas as estruturas do sistema operacional.
+	init( );
+
+	// Exibe a mensagem de boas-vindas.
+	write_lcd( 0 );
+
+	// Aguarda uma confirmação antes de abrir o menu principal.
+	STOP_BASH = input( );
+
+	// Mantém o sistema operacional em execução contínua.
+	//
+	// Como MAX_PROC_NUM é igual a 15, a condição 1 < MAX_PROC_NUM
+	// será sempre verdadeira. Portanto, esse laço funciona como
+	// um laço infinito.
+	while( 1 < MAX_PROC_NUM ) {
+
+		// Exibe e processa o menu principal do sistema.
+		bash( );
+	}
+
+	// Em condições normais, este retorno nunca será alcançado,
+	// pois o laço anterior mantém o sistema em funcionamento.
+	return;
+}
+
+
